@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -21,9 +22,12 @@ import (
 	_ "github.com/shaxbee/go-spatialite"
 )
 
+var help bool
+var basedir string
+var chanNums int
+
 var cnter int64
 var level int
-var basedir string
 var db *sql.DB
 var setlist []string
 var wg sync.WaitGroup
@@ -31,14 +35,15 @@ var workers chan string
 
 var bar *pb.ProgressBar
 
-//FetchTileset get tileset.json
+//fetchTileset get tileset.json
 func fetchTileset(uri string, depth bool) {
 	defer wg.Done()
 	defer func() {
 		<-workers
 	}()
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Microsecond * 200)
+
 	t := time.Now()
 	resp, err := http.Get(uri)
 	if err != nil {
@@ -72,9 +77,11 @@ func fetchTileset(uri string, depth bool) {
 	if err != nil {
 		log.Warnf("write tileset %v ~", err)
 	}
-	_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 1, 0, 1)
-	if err != nil {
-		log.Errorf("insert tileset %s error", err)
+	if depth {
+		_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 1, 0, 1)
+		if err != nil {
+			log.Errorf("insert tileset %s error, details:%v", uri, err)
+		}
 	}
 	bdReader := bytes.NewReader(body)
 	ts := tile3d.TilesetFromJson(bdReader)
@@ -94,6 +101,9 @@ func fetchTileset(uri string, depth bool) {
 
 //FetchTile get tile
 func fetchTile(uri string) {
+
+	time.Sleep(time.Microsecond * 200)
+
 	t := time.Now()
 	resp, err := http.Get(uri)
 	if err != nil {
@@ -131,7 +141,7 @@ func fetchTile(uri string) {
 
 	_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 2, 1, 1)
 	if err != nil {
-		log.Errorf("insert %s error", err)
+		log.Errorf("insert %s error, details:%v", uri, err)
 	}
 
 	secs := time.Since(t).Seconds()
@@ -160,7 +170,6 @@ func procChild(baseuri string, tile tile3d.Tile, depth bool) {
 
 func procContent(buri, curi string, depth bool) {
 	atomic.AddInt64(&cnter, 1)
-
 	bu, err := url.Parse(buri)
 	if err != nil {
 		log.Error(err)
@@ -264,10 +273,10 @@ func startFetcher(depth bool) {
 	}
 
 	bar = pb.New(total).Prefix(prestr).Postfix("\n")
-	// bar.SetRefreshRate(time.Second)
+	bar.SetRefreshRate(time.Second)
 	bar.Start()
 
-	workers = make(chan string, 4)
+	workers = make(chan string, chanNums)
 
 	for _, url := range setlist {
 		select {
@@ -286,51 +295,75 @@ func startFetcher(depth bool) {
 
 func main() {
 
-	basedir = "./tiles"
-	uri := "http://lab.earthsdk.com/ge/tileset.json"
-	u, err := url.Parse(uri)
-	os.MkdirAll(filepath.Join(basedir, filepath.Dir(u.Path)), os.ModePerm)
-
-	db, err = sql.Open("sqlite3", filepath.Join(basedir, filepath.Dir(u.Path), "tiles.db"))
+	flag.BoolVar(&help, "h", false, "Show this help")
+	flag.StringVar(&basedir, "o", "./output", "Specify output directory")
+	flag.IntVar(&chanNums, "c", 4, "Specify number of fetchers")
+	flag.Usage = usage
+	flag.Parse()
+	if help {
+		flag.Usage()
+	}
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Please specify the root tileset url ~\n")
+		flag.Usage()
+		return
+	}
+	os.MkdirAll(basedir, os.ModePerm)
+	var err error
+	db, err = sql.Open("sqlite3", filepath.Join(basedir, "tiles.db"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	_, err = db.Exec("PRAGMA synchronous=0")
-	if err != nil {
-		log.Fatal(err)
-	}
-	_, err = db.Exec("PRAGMA locking_mode=EXCLUSIVE")
-	if err != nil {
-		log.Fatal(err)
-	}
+	// _, err = db.Exec("PRAGMA synchronous=0")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// _, err = db.Exec("PRAGMA locking_mode=EXCLUSIVE")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
 	_, err = db.Exec("PRAGMA journal_mode=DELETE")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	_, err = db.Exec("create table if not exists tiles (u text ,t integer, s integer,c integer);")
+	_, err = db.Exec("create table if not exists tiles (u text NOT NULL PRIMARY KEY, t integer, s integer,c integer);")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var s, c int
-	err = db.QueryRow("SELECT s,c FROM tiles WHERE t=1 and u= ?;", uri).Scan(&s, &c)
-	if err == sql.ErrNoRows {
-		cnt := countTileset(uri)
-		_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 1, 0, cnt)
-		if err != nil {
-			log.Fatal(err)
-		}
-	} else if err != nil {
-		log.Fatal(err)
-	} else {
-		if s == 1 {
-			log.Infof("%s fetch finished", uri)
+	for _, u := range args {
+		var s, c int
+		err = db.QueryRow("SELECT s,c FROM tiles WHERE t=1 and u= ?;", u).Scan(&s, &c)
+		if err == sql.ErrNoRows {
+			cnt := countTileset(u)
+			_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", u, 1, 0, cnt)
+			if err != nil {
+				log.Errorf("insert tileset %s error, details:%v", u, err)
+				continue
+			}
+			fmt.Printf("url:%s, children:%d, status:%d\n", u, cnt, s)
+		} else if err != nil {
+			fmt.Printf("query url error, details: %v\n", err)
 		} else {
-			log.Infof("refetch %d children", c)
+			if s == 1 {
+				fmt.Printf(" %s already fetched\n", u)
+			} else {
+				fmt.Printf("url:%s, children:%d, status:%d\n", u, c, s)
+			}
 		}
 	}
 	start := time.Now()
 	startFetcher(false)
-	log.Printf("finished, consuming : %fs", time.Since(start).Seconds())
+	log.Printf("finished, consuming : %fs\n", time.Since(start).Seconds())
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `3dtbox version: 3dtbox/0.0.1
+Usage: 3dtbox [-h] [-o directory] url
+
+Options:
+`)
+	flag.PrintDefaults()
 }
