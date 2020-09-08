@@ -267,7 +267,7 @@ func startFetcher(depth bool) {
 	// bar.SetRefreshRate(time.Second)
 	bar.Start()
 
-	workers = make(chan string, 8)
+	workers = make(chan string, 4)
 
 	for _, url := range setlist {
 		select {
@@ -308,17 +308,29 @@ func main() {
 		log.Fatal(err)
 	}
 
-	_, err = db.Exec("create table if not exists tiles (u text,t integer, s integer,c integer);")
+	_, err = db.Exec("create table if not exists tiles (u text ,t integer, s integer,c integer);")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	cnt := countTileset(uri)
-	_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 1, 0, cnt)
-	if err != nil {
+	var s, c int
+	err = db.QueryRow("SELECT s,c FROM tiles WHERE t=1 and u= ?;", uri).Scan(&s, &c)
+	if err == sql.ErrNoRows {
+		cnt := countTileset(uri)
+		_, err = db.Exec("INSERT INTO tiles(u,t,s,c) values(?,?,?,?)", uri, 1, 0, cnt)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else if err != nil {
 		log.Fatal(err)
+	} else {
+		if s == 1 {
+			log.Infof("%s fetch finished", uri)
+		} else {
+			log.Infof("refetch %d children", c)
+		}
 	}
-	s := time.Now()
+	start := time.Now()
 	startFetcher(false)
-	log.Printf("finished, consuming : %fs", time.Since(s).Seconds())
+	log.Printf("finished, consuming : %fs", time.Since(start).Seconds())
 }
